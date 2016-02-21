@@ -1,0 +1,215 @@
+#! /usr/bin/env python
+# -*- coding: utf-8 -*-
+# vim:fenc=utf-8
+#
+# Copyright © 2016 Ivan Čukić <ivan.cukic(at)kde.org>
+#
+# Distributed under terms of the MIT license.
+
+import re, sys, os
+import evernote.edam.limits.constants as Limits
+
+from configobj import ConfigObj
+from termcolor import colored
+from geeknote.geeknote import *
+from bs4 import BeautifulSoup, NavigableString
+from taskw import TaskWarrior
+
+reload(sys)
+sys.setdefaultencoding('utf8')
+
+
+# ----- Common functions ----------------------------------------------------- #
+
+def cprint(text, color):
+    print(colored(str(text), color))
+
+
+# ----- Handling command-line arguments -------------------------------------- #
+
+arg_list_evernote_tags = '--list-tags' in sys.argv
+arg_help = '--help' in sys.argv
+
+
+# ----- Reading configuration ------------------------------------------------ #
+
+config = ConfigObj(os.path.expanduser('~/.task-evernote-rc'))
+
+def read_config(key, default):
+    try:
+        return config[key]
+    except:
+        return default
+
+taskwarrior_project    = read_config('project', 'evernote')
+maximum_summary_length = read_config('maximum_summary_length', 3 * 80)
+evernote_tag_uid       = read_config('tag_uid', None)
+
+
+# ----- Initializing interface for Evernote and Taskwarrior------------------- #
+
+geeknote  = None
+authToken = None
+noteStore = None
+tw        = None
+
+if evernote_tag_uid is None or arg_help:
+    if not arg_help:
+        cprint('You need to set tag_uid in your config file', 'red')
+
+else:
+    geeknote  = GeekNote()
+    authToken = geeknote.authToken
+    noteStore = geeknote.getNoteStore()
+    tw        = TaskWarrior()
+
+
+# ----- Evernote interface --------------------------------------------------- #
+
+def fetch_evernote_note(noteMeta):
+    note  = noteStore.getNote(authToken, noteMeta.guid, True, False, False, False)
+    title = note.title
+
+    id   = note.guid
+    xml  = note.content
+    soup = BeautifulSoup(xml, 'html.parser')
+    text = soup.text
+
+    return (id, title, text)
+
+
+def fetch_evernote_notes_for_tag(tagId):
+    filter = NoteStore.NoteFilter(tagGuids=[tagId], order = Types.NoteSortOrder.UPDATED)
+
+    meta = NoteStore.NotesMetadataResultSpec()
+    meta.includeTitle        = True
+    meta.includeNotebookGuid = True
+    meta.includeTagGuids     = True
+
+    count  = Limits.EDAM_USER_NOTES_MAX
+    return noteStore.findNotesMetadata(authToken, filter, 0, count, meta)
+
+
+def evernote_url(id):
+    return 'https://www.evernote.com/Home.action?login=true#n=' + id
+
+
+# ----- Taskwarrior interface ------------------------------------------------ #
+
+def taskwarrior_create_task(title, project):
+    return tw.task_add(title, project=project)
+
+
+def taskwarrior_fetch_task_for_enid(en_id):
+    return tw.filter_tasks({
+            'evernote_id' : en_id
+        })
+
+
+# ----- Main implementation -------------------------------------------------- #
+
+def update_task():
+    result = fetch_evernote_notes_for_tag(evernote_tag_uid)
+
+    for key, noteMeta in enumerate(result.notes):
+        print('')
+
+        (en_id, en_title, en_text) = fetch_evernote_note(noteMeta)
+
+        # By default, we do not have the task
+        tw_task = None
+
+        # Finding if we have a task for this evernote note
+        tw_tasks = taskwarrior_fetch_task_for_enid(en_id)
+
+        # If we have not found the task, we need to create it,
+        # if we do find it, we will just update it
+        if tw_tasks is None or len(tw_tasks) == 0:
+            tw_task = taskwarrior_create_task(en_title, taskwarrior_project)
+            tw_id   = tw_task.get(u'id')
+
+            cprint('Created task [' + str(tw_id) + '] ' + en_title, 'green')
+
+        elif len(tw_tasks) > 1:
+            cprint('Error: There are more than one TaskWarrior items matching this Evernote ID', 'red')
+            cprint(tw_ids, 'red')
+
+        else:
+            tw_task = tw_tasks[0]
+            tw_id = tw_task.get(u'id')
+
+            cprint('Updating task [' + str(tw_id) + '] ' + en_title, 'yellow')
+
+        print('Evernote ID ' + en_id)
+
+        # If we have found the task, we need to set the data,
+        # it is the same for new and already existing tasks
+        if tw_task is not None:
+            tw_task['evernote_id'] = en_id
+            tw_task['evernote_url'] = evernote_url(en_id)
+            tw_task['description'] = en_title
+
+            tw.task_update(tw_task)
+
+            current_annotations = tw._extract_annotations_from_task(tw_task)
+
+            content_annotation_present = False
+
+            en_text_stripped = en_text.replace('\n', ' ').strip()
+
+            if len(en_text_stripped) > maximum_summary_length:
+                en_text_stripped = en_text_stripped[:maximum_summary_length] + '...'
+
+            # Getting the URLs
+            urls = re.findall('http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\(\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+', en_text)
+
+            for annotation in current_annotations:
+                if annotation in urls:
+                    urls.remove(annotation)
+
+                if annotation.startswith('Evernote content: '):
+                    if annotation == 'Evernote content: ' + en_text_stripped:
+                        content_annotation_present = True
+                    else:
+                        tw.task_denotate(tw_task, annotation)
+
+            for url in urls:
+                tw.task_annotate(tw_task, url)
+
+            if not content_annotation_present:
+                tw.task_annotate(tw_task, 'Evernote content: ' + en_text_stripped)
+
+
+cprint('taskwarrior-evernote v1', 'blue')
+
+if evernote_tag_uid is None or arg_help:
+    print('''
+Pulls notes from Evernote that have specific tag and adds them
+to Taskwarrior as tasks.
+
+You need to set a few UDAs to Taskwarrior for this to work properly:
+
+    uda.evernote_url.type=string
+    uda.evernote_url.label=Evernote URL
+    uda.evernote_id.type=string
+    uda.evernote_id.label=Evernote ID
+
+Usage:
+
+    taskwarrior-evernote-sync               Pulls the notes from Evernote
+    taskwarrior-evernote-sync --list-tags   Lists Evernote tags and their UUIDs
+    taskwarrior-evernote-sync --help        This message
+
+Configuration options:
+
+    tag_uid        UID of the Evernote tag (required)
+    project        Tasks imported from Evernote will have this project set (default='evernote')
+    ''')
+
+elif arg_list_evernote_tags:
+    for tag in geeknote.findTags():
+        print(tag.guid + '\t' + tag.name)
+
+else:
+    update_task()
+
