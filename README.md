@@ -18,7 +18,7 @@ You need to set a few UDAs to Taskwarrior for this to work properly:
 
 ## Configuration options:
 
-    tag_uid         UID of the Evernote tag (required)
+    tag_uid        UID of the Evernote tag (required)
     project        Tasks imported from Evernote will have this project set (default='evernote')
 
 ## Requirements
